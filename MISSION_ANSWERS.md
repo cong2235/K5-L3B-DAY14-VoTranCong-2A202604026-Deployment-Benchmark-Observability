@@ -217,7 +217,118 @@ _(chưa làm)_
 
 ## Part 4: API Security
 
-_(chưa làm)_
+### Exercise 4.1: API Key authentication (`04-api-gateway/develop/app.py`)
+
+- **API key được check ở đâu?** Hàm `verify_api_key` (dòng 39–54), gắn vào endpoint bằng `Depends(verify_api_key)` (dòng 70). Key đúng lấy từ env `AGENT_API_KEY` (dòng 35), header đọc bằng `APIKeyHeader(name="X-API-Key")` (dòng 36). `/health` và `/` không có `Depends` nên công khai.
+- **Sai key thì sao?** Thiếu header → **401** `Missing API key`. Có header nhưng sai → **403** `Invalid API key`.
+- **Rotate key thế nào?** Key không nằm trong code, chỉ cần đổi biến môi trường `AGENT_API_KEY` trên nền tảng rồi restart/redeploy; không phải sửa code. (Hạn chế của bản demo: chỉ có **một** key nên đổi key là mọi client cũ hỏng ngay. Production thật nên cho phép nhiều key cùng lúc để đổi dần. Ngoài ra dòng 35 có giá trị mặc định `demo-key-change-in-production`, nếu quên đặt env thì chạy bằng key công khai đó, nên production phải bắt buộc đặt biến này.)
+
+```
+$ AGENT_API_KEY=secret-key-123 python app.py
+
+$ curl -i -X POST http://localhost:8000/ask -H "Content-Type: application/json" -d '{"question":"Hello"}'
+HTTP/1.1 401 Unauthorized
+{"detail":"Missing API key. Include header: X-API-Key: <your-key>"}
+
+$ curl -i -X POST http://localhost:8000/ask -H "X-API-Key: wrong-key" -H "Content-Type: application/json" -d '{"question":"Hello"}'
+HTTP/1.1 403 Forbidden
+{"detail":"Invalid API key."}
+
+$ curl -i -X POST http://localhost:8000/ask -H "X-API-Key: secret-key-123" -H "Content-Type: application/json" -d '{"question":"Hello"}'
+HTTP/1.1 200 OK
+{"question":"Hello","answer":"Agent đang hoạt động tốt! (mock response) Hỏi thêm câu hỏi đi nhé."}
+```
+
+### Exercise 4.2: JWT authentication (`04-api-gateway/production/`)
+
+**JWT flow** (`auth.py`): client gửi `POST /auth/token` với username/password → `authenticate_user` đối chiếu `DEMO_USERS` → `create_token` ký token HS256 bằng `JWT_SECRET`, trong payload có `sub` (user), `role`, `iat`, `exp` (hết hạn sau 60 phút) → client gửi lại `Authorization: Bearer <token>` ở mọi request → `verify_token` kiểm tra chữ ký và hạn rồi trả `{username, role}`. Server **không cần tra DB** mỗi request (stateless). Hết hạn → 401, token sai chữ ký → 403.
+
+Dùng tài khoản `student` / `demo123` (đường dẫn `/auth/token`; `CODE_LAB.md` ghi `/token` và `admin/secret` là không đúng với code). Token đã che:
+
+```
+$ curl -i -X POST http://localhost:8000/ask -H "Content-Type: application/json" -d '{"question":"Explain JWT"}'
+HTTP/1.1 401 Unauthorized
+{"detail":"Authentication required. Include: Authorization: Bearer <token>"}
+
+$ curl -i -X POST http://localhost:8000/auth/token -H "Content-Type: application/json" -d '{"username":"student","password":"bad"}'
+HTTP/1.1 401 Unauthorized
+{"detail":"Invalid credentials"}
+
+$ curl -i -X POST http://localhost:8000/auth/token -H "Content-Type: application/json" -d '{"username":"student","password":"demo123"}'
+HTTP/1.1 200 OK
+{"access_token":"<TOKEN>","token_type":"bearer","expires_in_minutes":60,...}
+
+$ curl -i -X POST http://localhost:8000/ask -H "Authorization: Bearer abc.def.ghi" -H "Content-Type: application/json" -d '{"question":"x"}'
+HTTP/1.1 403 Forbidden
+{"detail":"Invalid token."}
+
+$ curl -i -X POST http://localhost:8000/ask -H "Authorization: Bearer <TOKEN>" -H "Content-Type: application/json" -d '{"question":"Explain JWT"}'
+HTTP/1.1 200 OK
+{"question":"Explain JWT","answer":"...","usage":{"requests_remaining":9,"budget_remaining_usd":1.6e-05}}
+```
+
+### Exercise 4.3: Rate limiting (`rate_limiter.py`)
+
+- **Algorithm:** **Sliding window** (log of timestamps). Mỗi user có một `deque` chứa thời điểm các request; mỗi lần gọi thì bỏ timestamp cũ hơn `window_seconds`, nếu số còn lại `>= max_requests` thì trả 429 (dòng 110–137).
+- **Limit:** `rate_limiter_user` = **10 request / 60 giây**; `rate_limiter_admin` = **100 request / 60 giây** (dòng 161–162).
+- **Bypass cho admin:** không phải bypass hoàn toàn mà là *bậc cao hơn*: `app.py:141` chọn `rate_limiter_admin` khi `role == "admin"` (role nằm trong JWT). Tài khoản `teacher` (admin) gọi 15 lần liên tiếp đều 200 (giới hạn 100/phút).
+
+Vòng lặp 15 request liên tiếp bằng token `student`:
+
+```
+ 1..9   HTTP/1.1 200 OK
+10..15  HTTP/1.1 429 Too Many Requests
+        {"detail":{"error":"Rate limit exceeded","limit":10,"window_seconds":60,"retry_after_seconds":59}}
+
+Header của response 429:
+x-ratelimit-limit: 10
+x-ratelimit-remaining: 0
+x-ratelimit-reset: 1795682101
+retry-after: 59
+```
+
+429 bắt đầu từ request thứ **10** (không phải 11) vì trước vòng lặp tôi đã gọi 1 request bằng token hợp lệ ở Exercise 4.2, nên 1 trong 10 lượt đã dùng. `/me/usage` ghi nhận đúng `requests: 10`.
+
+### Exercise 4.4: Cost guard
+
+**Bản có sẵn (`cost_guard.py`)**, chạy trong bản production: mỗi lần `/ask`, `app.py` gọi `check_budget(user)` **trước** khi gọi LLM, rồi `record_usage(user, input_tokens, output_tokens)` **sau** khi gọi xong. Chi phí tính theo giá token (`$0.15/1M` input, `$0.60/1M` output của GPT-4o-mini). Có 3 lớp:
+
+| Ngưỡng | Hành vi |
+|---|---|
+| ≥ 80% budget ngày của user | ghi log cảnh báo, vẫn cho gọi |
+| ≥ **$1/ngày/user** | **402 Payment Required** |
+| ≥ **$10/ngày toàn hệ thống** | **503** cho mọi user (chặn thảm họa chi phí) |
+
+Tôi đã gọi trực tiếp module để kiểm chứng (vì với mock LLM không thể tiêu tới $1 bằng request thật):
+
+```
+sau 1 request nhỏ: 0.00021 USD, 0.0 %
+check_budget: OK (còn budget)
+sau khi tiêu nhiều: 1.65021 USD
+check_budget -> 402 {'error': 'Daily budget exceeded', 'used_usd': 1.65021, 'budget_usd': 1.0, 'resets_at': 'midnight UTC'}
+global budget  -> 503 Service temporarily unavailable due to budget limits. Try again tomorrow.
+```
+
+**Bản đề bài yêu cầu ($10/tháng/user, lưu trong Redis)** — cách làm của tôi:
+
+```python
+def check_budget(user_id: str, estimated_cost: float) -> bool:
+    key = f"budget:{user_id}:{datetime.now():%Y-%m}"   # key theo tháng → tự "reset" đầu tháng
+    current = float(r.get(key) or 0)
+    if current + estimated_cost > 10:
+        return False                                  # vượt → chặn
+    r.incrbyfloat(key, estimated_cost)                # cộng dồn chi phí
+    r.expire(key, 32 * 24 * 3600)                     # TTL 32 ngày → Redis tự dọn key tháng cũ
+    return True
+```
+
+- **Reset đầu tháng:** nhúng `YYYY-MM` vào tên key, sang tháng mới là key mới bắt đầu từ 0; TTL 32 ngày xóa key cũ, không cần job reset.
+- **Vì sao Redis chứ không phải RAM:** bản có sẵn lưu trong dict trong process, nên restart là mất số liệu và chạy nhiều instance thì mỗi instance đếm riêng (user gọi qua 3 instance được tiêu gấp 3 lần budget). Redis là nguồn chung duy nhất.
+- **Lưu ý:** đoạn trên là bản mẫu của đề, tôi chưa chạy nó với Redis thật (sẽ làm trong Part 6). Nó có lỗi race condition: `get` rồi `incrbyfloat` không nguyên tử, hai request đồng thời có thể cùng qua kiểm tra. Cách sửa: `INCRBYFLOAT` trước rồi so sánh kết quả trả về (vượt thì trừ lại), hoặc dùng Lua script.
+
+**Cần hiểu — vì sao cần cả rate limit và cost guard:** rate limit bảo vệ *tốc độ* (chặn lạm dụng, DoS), nhưng 10 request/phút kéo dài cả tháng với prompt rất dài vẫn có thể tốn rất nhiều tiền. Cost guard bảo vệ *tiền* (chặn theo tổng chi phí), nhưng không chặn được một đợt request dồn dập làm sập server trước khi chi phí kịp tăng. Hai lớp bù cho nhau.
+
+**Hạn chế chung của code mẫu:** `RateLimiter` và `CostGuard` đều lưu trong RAM của một process, nên không dùng được khi scale nhiều instance (xem Part 5); bản Part 6 phải chuyển sang Redis.
 
 ## Part 5: Scaling & Reliability
 
