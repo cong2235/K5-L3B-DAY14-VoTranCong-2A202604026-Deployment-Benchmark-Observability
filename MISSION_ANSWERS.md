@@ -213,7 +213,52 @@ Dọn stack: `docker compose -p k5-day14-docker down`.
 
 ## Part 3: Cloud Deployment
 
-_(chưa làm)_
+Lớp K5 deploy chính agent Part 6 (thư mục `06-lab-complete/`), không deploy app mẫu trong `03-cloud-deployment/` (xem `CHECKPOINTS.md`, CP6).
+
+### Exercise 3.2: Deploy lên Render (nền tảng chính)
+
+- **URL public:** https://ai-agent-hges.onrender.com
+- **Nền tảng:** Render, Blueprint (`06-lab-complete/render.yaml`), gồm 2 service: `ai-agent` (web, Docker) và `agent-redis` (Key Value, gói free). `REDIS_URL` được nối tự động từ `agent-redis` bằng `fromService`, `AGENT_API_KEY` do Render sinh (`generateValue: true`), không ghi trong code hay trong git.
+- **Kết quả kiểm tra trên URL public** (đo bằng `curl`; lệnh đầy đủ và biến môi trường xem `DEPLOYMENT.md`):
+
+| Lệnh | Kết quả |
+|---|---|
+| `GET /health` | **200** `{"status":"ok",...,"environment":"production"}` |
+| `GET /ready` | **200** `{"ready":true}` (nghĩa là agent nối được Redis trên Render) |
+| `POST /ask` không có key | **401** |
+| `POST /ask` key sai | **401** |
+| `GET /docs` | **404** (đã tắt khi `ENVIRONMENT=production`) |
+| `POST /ask` có `X-API-Key` đúng | _chưa kiểm tra, cần key trên dashboard Render_ |
+
+- **Lần deploy đầu bị lỗi:** Blueprint sync đầu tiên tạo được `agent-redis` nhưng `ai-agent` báo "Failed deploy". Lúc đó `render.yaml` chưa có `rootDir`. Theo tài liệu Render, `dockerfilePath` được tính theo `rootDir` (mặc định là gốc repo), trong khi Dockerfile nằm trong `06-lab-complete/`. Tôi dự đoán đây là nguyên nhân (chưa xem log build để xác nhận). Sau khi thêm `rootDir: 06-lab-complete` và sync lại thì service deploy thành công.
+- **Lưu ý gói free:** web service tự tắt sau 15 phút không có traffic và mất khoảng 1 phút để khởi động lại (lần gọi `/health` đầu tiên của tôi mất 11,9 giây). Free Key Value không lưu dữ liệu xuống đĩa, nên bộ đếm rate limit và chi phí về 0 mỗi lần Redis khởi động lại.
+
+### Exercise 3.1: Railway
+
+Chưa deploy lên Railway. Phần "nền tảng còn lại" được thay bằng bài so sánh cấu hình dưới đây (RUBRIC cho phép: "so sánh `railway.toml` với `render.yaml`").
+
+### So sánh `railway.toml` và `render.yaml` (của agent Part 6)
+
+| Khía cạnh | `railway.toml` | `render.yaml` | Vì sao khác |
+|---|---|---|---|
+| Kiểu build | `[build] builder = "DOCKERFILE"` | `runtime: docker` + `rootDir` + `dockerfilePath` | Cả hai đều build từ Dockerfile của mình, nên image giống hệt nhau trên cả hai nền tảng. Render cần `rootDir` vì file cấu hình nằm trong thư mục con |
+| Health check | `healthcheckPath = "/health"`, `healthcheckTimeout = 30` | `healthCheckPath: /health` | Cùng ý tưởng: chờ `/health` trả 200 mới chuyển traffic sang bản mới. Khác tên khóa (`healthcheck…` và `healthCheck…`) |
+| Restart | `restartPolicyType = "ON_FAILURE"`, `restartPolicyMaxRetries = 3` | Không khai báo (Render tự restart service lỗi) | Railway cho cấu hình chính sách restart ngay trong file |
+| **Redis** | **Không khai báo được.** Phải thêm Redis trong dashboard rồi đặt `REDIS_URL` thành `${{Redis.REDIS_URL}}` | **Khai báo ngay trong file:** service `type: keyvalue` + `fromService … property: connectionString` | Khác biệt quan trọng nhất. Render là "infrastructure as code" cho cả dịch vụ phụ thuộc, Railway chỉ mô tả service của bạn. Với Render, Blueprint tự dựng toàn bộ stack; với Railway, một phần làm thủ công và dễ quên |
+| Secret | Không có trong file; đặt bằng `railway variables set` hoặc dashboard | `AGENT_API_KEY` dùng `generateValue: true` (Render tự sinh); loại khác dùng `sync: false` | Cả hai đều không đưa secret vào git. Render sinh được key ngẫu nhiên ngay khi tạo, Railway thì bạn tự đặt |
+| Cổng | Railway cấp biến `PORT` | Render cấp biến `PORT` | Cả hai dùng chung quy ước. `CMD` trong Dockerfile đọc `${PORT:-8000}` nên một Dockerfile chạy được cả hai nơi |
+| Tạo dịch vụ | `railway up` từ CLI (đẩy trực tiếp code) | Tạo Blueprint từ repo GitHub, sau đó push là tự sync | Railway hướng CLI/đẩy code, Render hướng Git/khai báo |
+
+Hai file mẫu trong `03-cloud-deployment/` cũng khác file của tôi: mẫu Railway dùng `builder = "NIXPACKS"` + `startCommand`, mẫu Render dùng `runtime: python` + `buildCommand`. Tôi chọn Docker cho cả hai để build giống hệt môi trường đã kiểm chứng bằng `check_production_ready.py`, và vì tiêu chí chấm yêu cầu image multi-stage chạy bằng user non-root.
+
+### Exercise 3.3: Pipeline CI/CD của Cloud Run (chỉ đọc, không deploy)
+
+Đọc `03-cloud-deployment/production-cloud-run/cloudbuild.yaml` và `service.yaml`:
+
+- **Kích hoạt:** tự chạy khi push lên nhánh `main` (Cloud Build trigger), hoặc chạy tay bằng `gcloud builds submit`.
+- **4 bước nối tiếp** (mỗi bước `waitFor` bước trước, nên một bước lỗi thì pipeline dừng): (1) **test**: cài dependencies và chạy `pytest tests/` trong container `python:3.11-slim`; (2) **build**: dựng Docker image, gắn hai tag `$COMMIT_SHA` và `latest`, dùng `--cache-from` để tận dụng layer cũ; (3) **push**: đẩy mọi tag lên Container Registry; (4) **deploy**: `gcloud run deploy` với image gắn đúng `$COMMIT_SHA` (không phải `latest`, để mỗi bản deploy truy ngược được về commit), vùng `asia-southeast1`, `--min-instances=1` (tránh cold start), `--max-instances=10`, secret lấy từ Secret Manager.
+- **`service.yaml`** là bản khai báo (Knative) của chính service đó: scale 1–10 instance, mỗi instance nhận tối đa 80 request đồng thời, giới hạn CPU/RAM, `livenessProbe` gọi `/health`, `startupProbe` gọi `/ready`, secret qua `secretKeyRef`. Dùng với `gcloud run services replace`.
+- **Hai điểm tôi thấy trong file:** (a) bước deploy chỉ gắn secret `OPENAI_API_KEY`, còn `service.yaml` gắn thêm `AGENT_API_KEY`, nên hai cách deploy cho ra cấu hình khác nhau; (b) bước test chạy `pytest tests/` nhưng thư mục ví dụ này không có `tests/`, nên pipeline sẽ lỗi ngay ở bước đầu nếu dùng nguyên văn.
 
 ## Part 4: API Security
 
