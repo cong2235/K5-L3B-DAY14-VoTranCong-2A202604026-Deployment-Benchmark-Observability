@@ -45,7 +45,7 @@ curl -sS -o /dev/null -w '%{http_code}\n' -X POST "$BASE/ask" \
 | 2 | `GET /ready` | 200 | **200** |
 | 3 | `POST /ask` không key | 401 | **401** |
 | 3b | `POST /ask` key sai | 401 | **401** |
-| 4 | `POST /ask` có key đúng | 200 | _chưa kiểm tra (cần key)_ |
+| 4 | `POST /ask` có key đúng | 200 | **200** (0,89 giây) |
 
 Kiểm tra thêm: `GET /docs` trả 404 (tài liệu API bị tắt khi `ENVIRONMENT=production`).
 

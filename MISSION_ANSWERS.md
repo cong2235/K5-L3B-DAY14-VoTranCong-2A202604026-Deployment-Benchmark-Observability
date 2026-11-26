@@ -228,7 +228,7 @@ Lớp K5 deploy chính agent Part 6 (thư mục `06-lab-complete/`), không depl
 | `POST /ask` không có key | **401** |
 | `POST /ask` key sai | **401** |
 | `GET /docs` | **404** (đã tắt khi `ENVIRONMENT=production`) |
-| `POST /ask` có `X-API-Key` đúng | _chưa kiểm tra, cần key trên dashboard Render_ |
+| `POST /ask` có `X-API-Key` đúng | **200** (0,89 giây) |
 
 - **Lần deploy đầu bị lỗi:** Blueprint sync đầu tiên tạo được `agent-redis` nhưng `ai-agent` báo "Failed deploy". Lúc đó `render.yaml` chưa có `rootDir`. Theo tài liệu Render, `dockerfilePath` được tính theo `rootDir` (mặc định là gốc repo), trong khi Dockerfile nằm trong `06-lab-complete/`. Tôi dự đoán đây là nguyên nhân (chưa xem log build để xác nhận). Sau khi thêm `rootDir: 06-lab-complete` và sync lại thì service deploy thành công.
 - **Lưu ý gói free:** web service tự tắt sau 15 phút không có traffic và mất khoảng 1 phút để khởi động lại (lần gọi `/health` đầu tiên của tôi mất 11,9 giây). Free Key Value không lưu dữ liệu xuống đĩa, nên bộ đếm rate limit và chi phí về 0 mỗi lần Redis khởi động lại.
