@@ -332,4 +332,124 @@ def check_budget(user_id: str, estimated_cost: float) -> bool:
 
 ## Part 5: Scaling & Reliability
 
-_(chưa làm)_
+### Exercise 5.1: Health checks (`05-scaling-reliability/develop/app.py`)
+
+Hai endpoint đã được cài sẵn trong `develop/app.py` (dòng 104–168); tôi đọc, chạy và kiểm chứng chứ không viết lại.
+
+| Endpoint | Câu hỏi nó trả lời | Trả gì | Ai dùng |
+|---|---|---|---|
+| `GET /health` (liveness) | "Process còn sống không?" | 200 + `status`, `uptime_seconds`, `version`, kiểm tra bộ nhớ (psutil) | Platform: **non-200 hoặc timeout → restart container** |
+| `GET /ready` (readiness) | "Sẵn sàng nhận traffic chưa?" | 200 khi `_is_ready=True`, **503** khi đang khởi động hoặc đang shutdown | Load balancer: quyết định **có route traffic vào instance này không** (không restart) |
+
+```
+$ curl -i http://localhost:8000/health
+HTTP/1.1 200 OK
+{"status":"ok","uptime_seconds":4.0,"version":"1.0.0",...,"checks":{"memory":{"status":"ok","used_percent":44.5}}}
+
+$ curl -i http://localhost:8000/ready
+HTTP/1.1 200 OK
+{"ready":true,"in_flight_requests":1}
+```
+
+**Vì sao tách làm hai:** instance đang khởi động hoặc mất kết nối Redis thì *chưa nên nhận traffic* (`/ready` = 503) nhưng *không cần restart* (`/health` = 200). Gộp làm một thì platform sẽ restart liên tục một container chỉ đang chờ dependency.
+
+Quan sát nhỏ: `in_flight_requests` báo `1` dù không có request nào khác, vì middleware `track_requests` đếm cả chính request `/ready` đang gọi.
+
+### Exercise 5.2: Graceful shutdown
+
+Cơ chế đã có trong code: `lifespan` (dòng 54–66) đặt `_is_ready=False` rồi chờ `_in_flight_requests` về 0 (tối đa 30 giây), và `uvicorn.run(..., timeout_graceful_shutdown=30)`. Để thấy tác dụng, tôi dùng bản develop (mock LLM trễ 3 giây/request), gửi một request rồi bắn `SIGTERM` sau 1 giây, đối chứng với `SIGKILL`:
+
+```
+# SIGTERM khi request đang chạy
+gửi SIGTERM tới pid 3231 lúc request đang chạy...
+request MỚI ngay sau SIGTERM:  http=000  (không kết nối được: đã ngừng nhận)
+request ĐANG CHẠY DỞ:          {"answer":"..."}  [curl] http=200 time=2.876s   ← vẫn hoàn thành
+
+log server:
+INFO: Shutting down
+INFO: 127.0.0.1 - "POST /ask?question=LongTask HTTP/1.1" 200 OK
+INFO: Waiting for application shutdown.
+INFO  🔄 Graceful shutdown initiated...
+INFO  ✅ Shutdown complete
+
+# SIGKILL (đối chứng)
+[curl] http=000 exit=52      ← "Empty reply from server": request bị cắt ngang, client không nhận gì
+```
+
+**Kết luận:** với SIGTERM, server ngừng nhận kết nối mới, **để request đang chạy xong (200 sau 2,88 giây)**, rồi mới chạy phần dọn dẹp và thoát. SIGKILL thì không thể bắt được nên request mất hẳn. Platform luôn gửi SIGTERM trước, rồi SIGKILL sau một thời gian chờ nên code phải xử lý SIGTERM.
+
+Hai điều tôi quan sát được từ log, khác với phần mô tả trong comment của code:
+- Phần *chờ request* thực tế do **uvicorn** làm (nó đợi các kết nối đang mở rồi mới gọi `lifespan` shutdown). Lúc vòng lặp chờ trong `lifespan` chạy thì `in_flight` đã bằng 0 nên nó không phải chờ gì. Vòng lặp đó là lớp phòng thủ dự phòng, không phải thứ tạo ra hành vi graceful trong thử nghiệm này.
+- Sau khi `SIGTERM`, request mới bị **từ chối kết nối** (`http=000`) chứ không nhận 503 từ `/ready`, vì uvicorn đóng cổng lắng nghe ngay. Với load balancer, kết quả vẫn là "không gửi traffic vào instance này nữa".
+
+### Exercise 5.3: Stateless design (`05-scaling-reliability/production/app.py`)
+
+**Anti-pattern** là lưu state (history hội thoại) trong RAM của process. Khi chạy nhiều instance, mỗi instance có RAM riêng. `production/app.py` lưu session trong Redis (`save_session`/`load_session`, key `session:<id>`, TTL 1 giờ, giữ tối đa 20 message), nên instance nào cũng đọc được.
+
+Để chứng minh vấn đề, tôi chạy 2 instance **không có Redis** (app tự rơi về dict trong RAM) ở cổng 8001 và 8002:
+
+```
+instance A: POST /chat {"question":"My name is Alice"}  → session_id=9b29a2bc-...
+instance A: GET /chat/9b29a2bc-.../history              → có messages
+instance B: GET /chat/9b29a2bc-.../history              → HTTP/1.1 404 Not Found
+            {"detail":"Session 9b29a2bc-... not found or expired"}
+```
+
+Cùng một session mà sang instance B là mất sạch, đúng như đề mô tả ("Alice" ở instance 1, instance 2 không biết). Với Redis (mục 5.4–5.5) thì không bị.
+
+**Rủi ro thiết kế nên biết:** nếu Redis lỗi lúc khởi động thì app *im lặng rơi về RAM* (`USE_REDIS=False`) và `/ready` vẫn trả 200. Một instance cấu hình sai Redis sẽ trông khỏe mạnh nhưng lại hỏng state khi scale. Production thật nên fail fast (không khởi động) thay vì fallback.
+
+### Exercise 5.4: Load balancing
+
+```
+$ docker compose -p k5-day14-scaling up -d --build --scale agent=3
+k5-day14-scaling-agent-1   running  healthy
+k5-day14-scaling-agent-2   running  healthy
+k5-day14-scaling-agent-3   running  healthy
+k5-day14-scaling-nginx-1   running          0.0.0.0:8080->80/tcp
+k5-day14-scaling-redis-1   running  healthy
+```
+
+Gửi 12 request (mỗi request một session mới) qua Nginx (`:8080/chat`), đếm theo `served_by`:
+
+```
+4 instance-02bb10 redis
+4 instance-6d45f6 redis
+4 instance-a086f7 redis
+```
+
+Chia đều 4/4/4, tức round-robin. **Cơ chế:** Docker DNS trả về cả 3 IP cho tên `agent`, Nginx đưa cả 3 vào `upstream agent_cluster` rồi xoay vòng. Chú ý: `upstream` dạng tĩnh chỉ phân giải tên **một lần lúc Nginx khởi động**; nếu scale thêm instance sau đó thì phải reload Nginx (tôi chưa kiểm chứng điểm này, chỉ suy ra từ cấu hình).
+
+**Khi một instance chết:** tôi `docker kill` `agent-1` rồi gửi 9 request tiếp theo trong **cùng session**:
+
+```
+200 200 200 200 200 200 200 200 200
+```
+
+9/9 thành công, không request nào lỗi. Lý do là `proxy_next_upstream error timeout http_503` + `proxy_next_upstream_tries 3` trong `nginx.conf`: khi Nginx thử `agent-1` và gặp lỗi kết nối thì tự chuyển sang instance khác trong cùng request, client không thấy lỗi. Log của 2 instance còn lại nhận 11 + 11 request `POST /chat`.
+
+(Tôi chưa kiểm chứng việc `agent-1` có được Docker tự bật lại hay không: 7 giây sau khi kill, `docker compose ps` mới liệt kê 2 instance.)
+
+### Exercise 5.5: Test stateless
+
+`python test_stateless.py` gửi 5 câu trong **cùng một session**, rồi đọc history:
+
+```
+Session ID: 4b1bfc28-2214-49b7-ab51-0357abad1b13
+Request 1: [instance-02bb10]   Request 4: [instance-02bb10]
+Request 2: [instance-6d45f6]   Request 5: [instance-6d45f6]
+Request 3: [instance-a086f7]
+Instances used: {'instance-a086f7', 'instance-02bb10', 'instance-6d45f6'}
+✅ All requests served despite different instances!
+--- Conversation History ---
+Total messages: 10      (5 user + 5 assistant, đủ và đúng thứ tự)
+✅ Session history preserved across all instances via Redis!
+```
+
+**Giải thích:** 5 request của một hội thoại đi qua cả 3 instance khác nhau (round-robin), nhưng history vẫn đủ 10 message vì tất cả instance cùng đọc/ghi một chỗ là Redis. Instance không giữ gì trong RAM nên bị thay thế hay chết bất kỳ lúc nào cũng không mất hội thoại. Thử nghiệm kill ở 5.4 xác nhận thêm: sau khi mất `agent-1`, history của session vẫn còn nguyên (`messages = 20`, tin nhắn đầu là "My name is Alice").
+
+Xong thì dọn: `docker compose -p k5-day14-scaling down`.
+
+**Cần hiểu (CP4):**
+- *Liveness khác readiness:* liveness (`/health`) trả lời "có cần restart không", readiness (`/ready`) trả lời "có nên gửi traffic vào không".
+- *State trong RAM hỏng khi chạy nhiều instance:* mỗi instance có bộ nhớ riêng, request kế tiếp có thể rơi vào instance khác (xem 404 ở Ex 5.3). Phải đưa state ra ngoài (Redis).
