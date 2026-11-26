@@ -81,7 +81,135 @@ Khi gửi SIGTERM, log ghi `Shutting down` → `Waiting for application shutdown
 
 ## Part 2: Docker
 
-_(chưa làm)_
+### Exercise 2.1: Dockerfile questions (`02-docker/develop/Dockerfile`)
+
+1. **Base image:** `python:3.11` (dòng 8), bản Python đầy đủ. Đo được **1.62 GB** trên máy này (`docker images python`).
+2. **Working directory:** `/app` (dòng 11, `WORKDIR /app`). Các lệnh `COPY`, `RUN`, `CMD` phía sau đều tính từ thư mục này.
+3. **Vì sao `COPY requirements.txt` trước:** Docker cache theo từng layer, và một layer bị làm mất cache thì mọi layer sau nó cũng build lại. `requirements.txt` ít khi đổi còn code đổi liên tục. Đặt `requirements.txt` + `pip install` trước thì khi chỉ sửa code, Docker dùng lại layer đã cài thư viện và chỉ chạy lại bước `COPY app.py`. Nếu `COPY . .` đứng trước, mỗi lần sửa một dòng code lại phải `pip install` từ đầu.
+4. **CMD vs ENTRYPOINT:** `CMD` là lệnh mặc định, bị thay hoàn toàn nếu truyền lệnh khác khi `docker run` (ví dụ `docker run image bash`). `ENTRYPOINT` là chương trình cố định của container; tham số truyền sau tên image được nối vào cuối chứ không thay thế. Hay dùng cùng nhau: `ENTRYPOINT` là chương trình, `CMD` là tham số mặc định.
+
+### Exercise 2.2: Build và run bản develop
+
+Build từ gốc repo vì Dockerfile `COPY` theo đường dẫn tính từ gốc:
+
+```
+$ docker build -f 02-docker/develop/Dockerfile -t my-agent:develop .
+$ docker run -d -p 8000:8000 my-agent:develop
+$ curl -i -X POST "http://localhost:8000/ask?question=What%20is%20Docker%3F"
+HTTP/1.1 200 OK
+{"answer":"Container là cách đóng gói app để chạy ở mọi nơi. Build once, run anywhere!"}
+$ curl http://localhost:8000/health
+{"status":"ok","uptime_seconds":4.5,"container":true}
+$ docker exec <container> whoami
+root
+```
+
+Container develop chạy bằng **root** (không có `USER`), đây là điểm kém an toàn so với bản production.
+
+### Exercise 2.3: Multi-stage build và so sánh kích thước
+
+Đọc `02-docker/production/Dockerfile`:
+
+- **Stage 1 (`builder`, `python:3.11-slim`):** cài `gcc`, `libpq-dev` (công cụ biên dịch), rồi `pip install --user -r requirements.txt` vào `/root/.local`. Stage này chỉ để *build*, không bao giờ được deploy.
+- **Stage 2 (`runtime`, `python:3.11-slim`):** tạo user không phải root (`appuser`), chỉ `COPY --from=builder /root/.local` (các thư viện đã cài) và code, thêm `HEALTHCHECK`, chạy `uvicorn` với 2 workers.
+- **Vì sao nhỏ hơn:** (1) base `slim` thay vì bản đầy đủ; (2) `gcc`, `libpq-dev`, cache apt, cache pip nằm trong stage builder và bị bỏ đi, image cuối không chứa chúng; (3) chỉ copy phần cần để chạy.
+
+```
+$ docker build -f 02-docker/production/Dockerfile -t my-agent:advanced .
+$ docker images | grep my-agent
+my-agent:advanced     240MB
+my-agent:develop      1.67GB
+```
+
+| Image | Kích thước (`docker images`) |
+|---|---|
+| Develop (`python:3.11`, single-stage) | **1.67 GB** (≈ 1670 MB) |
+| Production (`python:3.11-slim`, multi-stage) | **240 MB** |
+| Chênh lệch | giảm ≈ **1430 MB, tức ≈ 86%** (production chỉ bằng ~14% develop) |
+
+Số trên là số tôi đo trên máy này bằng `docker images`, không chép từ README. Image production đạt mục tiêu `< 500 MB` của đề.
+
+Chạy thử bản production:
+
+```
+$ docker run -d -p 8000:8000 my-agent:advanced
+$ curl -i -X POST http://localhost:8000/ask -H "Content-Type: application/json" -d '{"question":"What is Docker?"}'
+HTTP/1.1 200 OK
+$ curl http://localhost:8000/ready
+{"ready":true}
+$ docker exec <container> whoami
+appuser
+$ docker inspect <container> --format '{{.State.Health.Status}}'
+healthy
+```
+
+### Exercise 2.4: Docker Compose stack
+
+Compose project `k5-day14-docker` (`docker compose -p k5-day14-docker up -d --build`). 4 service đều lên, `agent`, `redis`, `qdrant` ở trạng thái `healthy`:
+
+```
+agent    running  healthy  8000/tcp          (chỉ mạng nội bộ)
+nginx    running           0.0.0.0:80->80, 443->443
+qdrant   running  healthy  6333-6334/tcp     (chỉ mạng nội bộ)
+redis    running  healthy  6379/tcp          (chỉ mạng nội bộ)
+```
+
+**Sơ đồ kiến trúc:**
+
+```
+                 Internet / Client
+                        │  :80 / :443   (cổng duy nhất mở ra host)
+                        ▼
+              ┌───────────────────┐
+              │      nginx        │  reverse proxy + load balancer
+              │  rate limit 10r/s │  security headers, 429 khi vượt
+              └─────────┬─────────┘
+   ═════════════════════╪═══════ mạng nội bộ `internal` (bridge) ═══════
+                        │ upstream agent:8000
+                        ▼
+              ┌───────────────────┐
+              │   agent (FastAPI) │  uvicorn, user appuser, /health
+              └────┬─────────┬────┘
+        REDIS_URL  │         │  QDRANT_URL
+   redis://redis:6379/0      │  http://qdrant:6333
+                   ▼         ▼
+             ┌─────────┐  ┌──────────┐
+             │  redis  │  │  qdrant  │   volumes: redis_data, qdrant_data
+             │ session │  │  vector  │   (dữ liệu giữ lại khi restart)
+             │ + rate  │  │    DB    │
+             └─────────┘  └──────────┘
+```
+
+**Giao tiếp giữa các service:** tất cả nằm trong mạng bridge `internal`, gọi nhau bằng *tên service* (DNS của Compose): nginx → `agent:8000`, agent → `redis:6379` và `qdrant:6333`. `depends_on` + `condition: service_healthy` bắt agent chờ Redis và Qdrant healthy rồi mới khởi động. Chỉ nginx publish cổng ra host; `agent`, `redis`, `qdrant` không thể truy cập trực tiếp từ ngoài.
+
+**Kết quả test qua Nginx (cổng 80):**
+
+```
+$ curl -i http://localhost/health
+HTTP/1.1 200 OK
+Server: nginx                      ← version bị ẩn (server_tokens off)
+X-Frame-Options: DENY
+X-Content-Type-Options: nosniff
+X-XSS-Protection: 1; mode=block
+{"status":"ok","uptime_seconds":32.2,"version":"2.0.0",...}
+
+$ curl -i -X POST http://localhost/ask -H "Content-Type: application/json" -d '{"question":"Explain microservices"}'
+HTTP/1.1 200 OK
+{"answer":"Agent đang hoạt động tốt! (mock response) Hỏi thêm câu hỏi đi nhé."}
+
+$ curl -m 3 http://localhost:8000/health     # gọi thẳng agent, bỏ qua nginx
+http=000  (không kết nối được, đúng thiết kế)
+$ docker compose -p k5-day14-docker exec redis redis-cli ping
+PONG
+```
+
+Khi bắn nhanh 40 request liên tiếp bằng vòng lặp `curl` thì cả 40 đều trả 200, không có 429. Lý do: Nginx cho 10 req/giây và `burst=20`, mà `curl` chạy tuần tự chậm hơn mức đó, nên chưa chạm giới hạn. Tôi không kết luận rate limit "đã hoạt động" từ thí nghiệm này.
+
+Dọn stack: `docker compose -p k5-day14-docker down`.
+
+**Cách debug container (checkpoint 2):** `docker logs <container>` (hoặc `docker compose -p ... logs agent`) xem log; `docker exec -it <container> sh` vào trong; `docker inspect --format '{{.State.Health.Status}}'` xem trạng thái healthcheck.
+
+**Ghi chú môi trường:** lúc build lần đầu Docker Hub trả `429 Too Many Requests` (giới hạn pull ẩn danh). Tôi lấy `python:3.11` và `python:3.11-slim` từ `mirror.gcr.io` (bản sao công khai của Docker Hub do Google chạy) rồi gắn lại tag cùng tên, nên Dockerfile không phải sửa.
 
 ## Part 3: Cloud Deployment
 
