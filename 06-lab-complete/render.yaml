@@ -6,10 +6,17 @@
 # Secret KHÔNG ghi thẳng giá trị vào file (file này nằm trong git):
 #   • generateValue: true → Render tự sinh chuỗi ngẫu nhiên, xem lại trong dashboard
 #   • sync: false         → để trống trong file, bạn nhập giá trị trên dashboard khi tạo Blueprint
+#
+# File này nằm trong thư mục con, không phải gốc repo, nên:
+#   • Khi tạo Blueprint trên dashboard, điền ô "Blueprint Path" = 06-lab-complete/render.yaml
+#   • `rootDir` bên dưới trỏ tới thư mục chứa Dockerfile; `dockerfilePath` tính theo rootDir
+#     (theo tài liệu Render: "relative to the service's rootDir"). Thiếu rootDir thì Render
+#     tìm Dockerfile ở gốc repo và build lỗi.
 services:
   - type: web
     name: ai-agent
     runtime: docker
+    rootDir: 06-lab-complete
     dockerfilePath: ./Dockerfile
     plan: free
     healthCheckPath: /health
