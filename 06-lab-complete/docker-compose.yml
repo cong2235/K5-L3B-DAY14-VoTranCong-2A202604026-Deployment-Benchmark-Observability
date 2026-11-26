@@ -1,12 +1,45 @@
 # ============================================================
-# TODO (tiêu chí 2): chạy agent + redis bằng một lệnh `docker compose up`
-#   • service agent: build từ Dockerfile, map port 8000, đọc thêm env từ .env
-#     (dùng `required: false` để không có file .env vẫn chạy được)
-#   • service redis: image redis:7-alpine, có healthcheck
-#   • agent có REDIS_URL=redis://redis:6379/0 và depends_on redis
+# Agent + Redis chạy bằng một lệnh:  docker compose up --build   (tiêu chí 2)
+#
+# Chuẩn bị:  cp .env.example .env     (đặt AGENT_API_KEY của bạn trong .env)
 # ============================================================
 services:
+
   agent:
     build: .
     ports:
       - "8000:8000"
+    # Nạp biến từ .env nếu có. `required: false` để không có file .env vẫn chạy được
+    # (khi đó AGENT_API_KEY rỗng nên mọi request /ask bị từ chối: an toàn, không có key mặc định).
+    env_file:
+      - path: .env
+        required: false
+    # `environment` ưu tiên hơn env_file. Hai giá trị này gắn với compose nên ghi đè cố định:
+    #   • REDIS_URL phải trỏ tới service `redis` (trong .env là localhost, chỉ đúng khi chạy ngoài Docker)
+    #   • PORT trong container luôn là 8000 để khớp với `ports` bên trên
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      PORT: "8000"
+    depends_on:
+      redis:
+        condition: service_healthy   # chờ Redis sẵn sàng rồi mới khởi động agent
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    # appendonly: giữ bộ đếm chi phí qua lần restart Redis (nếu mất, budget ngày sẽ bị reset).
+    # Không đặt maxmemory-policy eviction: bộ nhớ đầy thì ghi lỗi → agent trả 503 (an toàn)
+    # thay vì âm thầm xoá bộ đếm của rate limit / cost guard.
+    command: redis-server --appendonly yes --maxmemory 64mb
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+    # Không publish cổng 6379 ra host: chỉ agent trong mạng compose truy cập được Redis.
+
+volumes:
+  redis_data:
