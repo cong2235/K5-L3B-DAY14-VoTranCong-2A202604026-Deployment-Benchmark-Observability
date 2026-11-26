@@ -453,3 +453,76 @@ Xong thì dọn: `docker compose -p k5-day14-scaling down`.
 **Cần hiểu (CP4):**
 - *Liveness khác readiness:* liveness (`/health`) trả lời "có cần restart không", readiness (`/ready`) trả lời "có nên gửi traffic vào không".
 - *State trong RAM hỏng khi chạy nhiều instance:* mỗi instance có bộ nhớ riêng, request kế tiếp có thể rơi vào instance khác (xem 404 ở Ex 5.3). Phải đưa state ra ngoài (Redis).
+
+## Part 6: Final Project (`06-lab-complete/`)
+
+### Kết quả chấm
+
+`python check_production_ready.py` (bản đầy đủ, có Docker, chạy trong WSL2 Ubuntu, Python 3.12, `os.name == posix`):
+
+```
+================================================================
+  📋 Checklist Deliverable
+     ✅ Dockerfile (multi-stage, < 500 MB)
+     ✅ docker-compose.yml (agent + redis)
+     ✅ .dockerignore
+     ✅ Health check endpoint (GET /health)
+     ✅ Readiness endpoint (GET /ready)
+     ✅ API Key authentication
+     ✅ Rate limiting
+     ✅ Cost guard
+     ✅ Config từ environment variables
+     ✅ Structured logging
+     ✅ Graceful shutdown
+     ✅ Public URL ready (Railway / Render config)
+----------------------------------------------------------------
+  Result: 12/12 tiêu chí đạt · 43/43 checks passed
+  🎉 PASS 12/12 — PRODUCTION READY! Deploy nào!
+================================================================
+```
+
+Số đo từ chính lần chạy này: image `< 500 MB` đạt với **63 MB** (số script đọc từ `docker image inspect`, là kích thước nén); `docker images` hiển thị **286 MB** cho image build bằng compose (số trên đĩa). Hai số đo cùng một image theo hai cách tính khác nhau, đều dưới 500 MB. `docker stop` tắt trong **0,9 giây** (script) / **2,6 giây** (đo tay), exit code **0**.
+
+Script chỉ *đọc* `docker-compose.yml` chứ không chạy nó, nên tôi tự chạy `docker compose up` rồi kiểm tra: `/health` 200, `/ready` 200, không key → 401, key sai → 401, 12 request liên tiếp với `RATE_LIMIT_PER_MINUTE=10` cho `200×10` rồi `429×2` kèm `Retry-After: 59`; trong Redis chỉ có khóa đã băm `rl:57c8…` (không lộ API key) và `cost:2026-11-26`; PID 1 trong container là `uvicorn`; tiến trình chạy bằng user `agent` (không phải root); không có file `.env` bên trong image; không dòng log nào chứa API key; mọi dòng log của app là JSON.
+
+### Các quyết định thiết kế và lý do
+
+| Phần | Quyết định | Vì sao |
+|---|---|---|
+| `config.py` | Đọc env bằng `default_factory`, sai kiểu thì dừng ngay khi khởi động. `AGENT_API_KEY` mặc định rỗng; `ENVIRONMENT=production` mà thiếu key thì không khởi động | Fail fast, không chạy sai âm thầm. Không có key mặc định ai cũng biết (bản demo Part 4 có `demo-key-change-in-production`, là điểm yếu) |
+| `auth.py` | `auto_error=False` + tự `raise 401`; so key bằng `secrets.compare_digest`; thiếu key và sai key trả cùng một thông báo; chưa cấu hình key → từ chối tất cả | Hợp đồng đòi 401 (mặc định FastAPI trả 403 khi thiếu header). `compare_digest` chống timing attack |
+| `redis_client.py` | `redis.from_url` (lazy, không ping lúc import) + timeout 1s/2s | App phải khởi động được khi Redis chưa lên; `/ready` phải trả 503 nhanh chứ không treo |
+| `rate_limiter.py` | Sliding window bằng Redis sorted set, toàn bộ trong **một Lua script**; thời gian lấy từ lệnh `TIME` của Redis; khóa dùng hash SHA-256 của API key | Gợi ý của đề (`ZREMRANGEBYSCORE → ZCARD → ZADD` là các lệnh riêng) không nguyên tử: với `--workers 2` hai worker có thể cùng đọc 9/10 rồi cùng thêm thành 11/10. Lua loại bỏ race này. Một đồng hồ duy nhất (Redis) tránh lệch giờ giữa các instance |
+| `cost_guard.py` | Bộ đếm USD theo ngày UTC (`cost:YYYY-MM-DD`) bằng `INCRBYFLOAT`, TTL 2 ngày; `check_budget` trước khi gọi LLM, `record_cost` sau | Sang ngày mới là khóa mới nên không cần job reset. Kiểm tra trước để request bị từ chối không tốn tiền |
+| Khi Redis chết | `/ask` trả **503** (fail closed), `/ready` trả 503, `/health` vẫn 200 | Rate limit và cost guard là hai lớp bảo vệ tiền. Nếu "fail open" thì chỉ cần làm Redis chết là gọi LLM không giới hạn. `/health` không phụ thuộc Redis để platform không restart agent liên tục vì lỗi của Redis |
+| Thứ tự trong `/ask` | auth → rate limit → cost guard → LLM → ghi chi phí | Từ rẻ đến đắt: kẻ chưa xác thực bị chặn trước khi chạm Redis nên không làm đầy bộ đếm của người khác |
+| Logging (`log.py`) | Logger riêng `agent` với handler JSON, `propagate=False`; chỉ log độ dài câu hỏi, không log nội dung/key | Sửa đúng lỗi ở Part 1 (`basicConfig` bị vô hiệu vì module khác log trước). Không trộn với log uvicorn |
+| Graceful shutdown | **Không** đăng ký signal handler; dùng `lifespan` để đóng pool Redis | Uvicorn đã xử lý SIGTERM đúng thứ tự (đóng cổng → chờ request → chạy lifespan → exit 0). Tự viết handler mà không gọi lại handler cũ của uvicorn sẽ làm process không bao giờ tắt |
+| Dockerfile | Multi-stage; builder tạo `/opt/venv`, runtime chỉ copy venv + code; user hệ thống `agent` (uid 10001); `HEALTHCHECK` bằng `urllib`; `CMD ["sh","-c","exec uvicorn ... --port ${PORT:-8000} --workers ${WEB_CONCURRENCY:-2}"]` | `exec` làm uvicorn thành PID 1 để nhận SIGTERM (thiếu thì `docker stop` đợi 10s rồi SIGKILL, exit 137). Không cài `gcc` vì mọi dependency đều có wheel dựng sẵn |
+| `docker-compose.yml` | `env_file` với `required: false`; `REDIS_URL` và `PORT` đặt cứng trong `environment`; Redis có healthcheck, `appendonly`, `maxmemory 64mb`, không đặt eviction, không publish cổng 6379 | `environment` ưu tiên hơn `env_file` nên `.env` (trỏ `localhost`) không phá được kết nối nội bộ. Không eviction: bộ nhớ đầy thì ghi lỗi → agent 503, thay vì âm thầm xoá bộ đếm của rate limit/cost guard |
+| `.dockerignore` | Loại `.env`, `.env.*` (giữ `!.env.example`), `__pycache__`, `venv`, `.git`, `*.md`, `benchmark-observability/` | Secret không bao giờ vào image; build context nhỏ |
+| `railway.toml` / `render.yaml` | Viết cả hai. Railway: `builder = "DOCKERFILE"`, `healthcheckPath`. Render: khai báo luôn Redis (`type: keyvalue`), nối `REDIS_URL` bằng `fromService`, `AGENT_API_KEY` dùng `generateValue: true` | Dùng cho phần so sánh hai nền tảng ở Part 3 (làm ở CP6). Khác biệt chính: Render khai báo được Redis ngay trong file, Railway thì phải thêm Redis trong dashboard |
+
+### Hạn chế đã biết
+
+- **Cost guard là bộ đếm toàn cục**, không tách theo API key (hợp đồng chỉ yêu cầu tổng chi phí). Script chấm chạy nhiều pha trên cùng một Redis tạm nên chi phí tích luỹ từ các pha trước, và pha cost guard báo 402 ngay ở request đầu (`402 ở request thứ 1`). Kết quả đúng với thiết kế, nhưng cho thấy bộ đếm dùng chung.
+- **Kiểm tra trước, ghi nhận sau** nên N request đồng thời sát ngưỡng có thể vượt budget cỡ N × chi phí một request (~1e-5 USD). Muốn chặt hơn phải "đặt trước" chi phí ước tính.
+- **Ước lượng token thô** (~4 ký tự/token) vì mock LLM không trả số token thật.
+- **Base image `python:3.11-slim`**: trình phân tích của IDE báo image có 5 lỗ hổng mức cao (CVE của gói Debian trong base image). Chưa xử lý; production thật nên ghim digest và quét định kỳ.
+- **Chưa deploy lên cloud và chưa chạy 4 lệnh tự kiểm của CP6** (`/health`, `/ready`, `/ask` không key, `/ask` có key trên URL public). Phần này làm ở CP6.
+
+## AI log
+
+Theo `RULES.md` mục 1, ghi lại việc dùng AI. **Toàn bộ nội dung bài này, gồm code Part 6 và các câu trả lời Part 1–5, do Claude Code (Anthropic, mô hình Claude Sonnet 5.5) thực hiện theo yêu cầu của tôi** trong một phiên làm việc. Tôi ghi rõ điều này để Lab Coach biết; tôi sẽ đọc lại và phải giải thích được từng đoạn code trong `06-lab-complete/app/` khi được hỏi.
+
+| Việc | Tôi yêu cầu | AI làm / cho tôi | Kiểm tra bằng cách nào |
+|---|---|---|---|
+| Môi trường | Cài sẵn môi trường lab | Tạo venv trong WSL2 Ubuntu, cài requirements; xử lý lỗi DNS của WSL (apt treo) và Docker Hub trả 429 (lấy base image từ `mirror.gcr.io` rồi gắn lại tag) | `pip check` sạch, `os.name == posix`, build image thành công |
+| Part 1–2 | Làm CP1, CP2 | Đọc code, chạy bản develop/production, build hai image, dựng stack compose, ghi kết quả | Số MB lấy từ `docker images` trên máy tôi; kiểm tra cả `whoami` và healthcheck chứ không chỉ `curl` |
+| Part 4 | Làm CP3 | Chạy các trường hợp 401/403/200/429, kiểm tra cost guard bằng cách gọi trực tiếp module | Output `curl -i` thật; chỉ ra lệch giữa `CODE_LAB.md` và code thật (`/auth/token`, `student/demo123`); nói rõ đoạn Redis $10/tháng của đề **chưa được chạy** |
+| Part 5 | Làm CP4 | Chạy health/shutdown/stateless, dựng 3 instance sau Nginx, `docker kill` một instance giữa chừng | SIGTERM so với SIGKILL; 404 khi không có Redis so với đủ history khi có Redis; 9/9 request thành công sau khi kill |
+| Part 6 | Làm CP5, kèm giải thích logic | Đọc toàn bộ `check_production_ready.py` trước khi viết code, rồi viết `app/*.py`, `Dockerfile`, `.dockerignore`, `docker-compose.yml`, `.env.example`, `railway.toml`, `render.yaml`. Lần chạy đầy đủ đầu tiên đạt 12/12 | `check_production_ready.py` báo `PASS 12/12`; tự chạy `docker compose up` rồi kiểm tra rate limit, khóa Redis đã băm, PID 1, user, `docker stop`. Chạy chế độ `--skip-docker` trước để tách lỗi code với lỗi Docker |
+
+**Những chỗ AI làm khác gợi ý của đề, và lý do** (để tôi giải thích được): dùng Lua script thay cho các lệnh Redis rời; `compare_digest` thay cho `==`; fail closed khi Redis chết; không tự đăng ký handler SIGTERM; logger riêng thay vì `basicConfig`. Chi tiết trong bảng quyết định thiết kế ở trên.
+
+**Điều AI chưa làm:** deploy lên Railway hoặc Render (cần tài khoản của tôi), chạy Part 7 Bước 2, chụp ảnh màn hình.
