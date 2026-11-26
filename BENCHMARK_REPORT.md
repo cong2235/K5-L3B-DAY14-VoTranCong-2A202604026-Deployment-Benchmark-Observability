@@ -129,16 +129,76 @@ Cần bật *Settings → Branches → Branch protection → Require status chec
 
 ## 4. Observability stack (production)
 
-_Chưa làm. Thuộc CP8 (Part 7 Bước 2, Exercise 7.4–7.7): ảnh Grafana, trace chậm và trace lỗi trong Jaeger, alert firing, thí nghiệm A–E, debug bằng trace._
+Stack chạy local bằng `docker compose` (project `k5-day14-observability`): nginx → 2 agent, Prometheus (scrape 5 giây), Grafana (`localhost:3001`), Jaeger. Tải nền do Locust tạo (20–30 user).
+
+### 4.1 Bằng chứng
+
+| Hạng mục | File |
+|---|---|
+| Dashboard Golden Signals | `screenshots/grafana-dashboard.png` |
+| Trace chậm (không lỗi) | `screenshots/jaeger-slow-trace.png` |
+| Trace lỗi có event `exception` | `screenshots/jaeger-error-trace.png` |
+| Alert đang firing | `screenshots/prometheus-alert-firing.png` |
+
+Bốn alert rule: `AgentHighErrorRate` (>5% trong 1 phút), `AgentHighLatencyP95` (>1 giây trong 2 phút), `AgentInstanceDown` (`up==0` trong 30 giây), `LLMCostBurnRateHigh` (>$2/giờ trong 2 phút).
+
+### 4.2 Thí nghiệm A–E
+
+Mỗi thí nghiệm đổi đúng một biến qua `.env`, đo thời gian từ lúc đổi đến khi alert chuyển `firing`, rồi hoàn tác.
+
+| # | Thay đổi | Alert kỳ vọng | Pending sau | Firing sau |
+|---|---|---|---|---|
+| A | `MOCK_ERROR_RATE=0.2` | `AgentHighErrorRate` | 36 giây | **100 giây** |
+| B | `MOCK_SLOW_RATE=0.3` | `AgentHighLatencyP95` | 25 giây | **146 giây** |
+| C | `LLM_MODEL=mock-llm-large` | `LLMCostBurnRateHigh` | khoảng 6 giây (lần làm lại) | **163 giây** |
+| D | `docker pause` 1 instance | `AgentInstanceDown` | — | **38 giây** |
+| E | `AGENT_VERSION=v1` | không có | — | không firing trong 240 giây |
+
+Lưu ý khi đọc số liệu:
+- A và B chạy ở 30 user. C, D, E chạy ở 20 user.
+- **Thí nghiệm C lần đầu không hợp lệ.** Chi phí nền ở 30 user là $2,09/giờ, đã vượt ngưỡng $2/giờ nên alert tự kêu trước khi đổi model. Tôi giảm tải xuống 20 user, chờ chi phí về $1,55/giờ rồi làm lại. Số liệu trong bảng là của lần làm lại. Đổi model làm chi phí tăng gấp khoảng 4 lần (từ $2,09 lên $8,79/giờ trong lần đo đầu).
+- **Câu hỏi của E: v1 làm gì?** v1 không kích hoạt alert nào. Chi phí giảm (từ $1,46 xuống $0,77/giờ), p95 giảm (0,44 xuống 0,20 giây), nhưng chất lượng tụt từ 100% xuống 4,3% theo mục 3. Vì vậy bốn alert hiện tại **không phát hiện được** suy giảm chất lượng. Cần thêm tín hiệu chất lượng (tỉ lệ retrieval hit, eval định kỳ) thì mới bắt được lỗi này.
+
+### 4.3 Debug bằng trace_id
+
+Trace chậm `5b4691158378a433e87d3b98e6687ab5`: tổng 1849,8 ms, trong đó span `chat mock-llm-small` chiếm 1818,7 ms (98,3%) còn `agent.retrieve_context` chỉ 17 ms. Nút thắt là lời gọi LLM, không phải retrieval hay code agent. Log JSON cùng `trace_id` xác nhận: `llm_call` có `llm_ms` 1665,6 và `http_request` trả 200 sau 1846,6 ms.
+
+Trace lỗi `d793f6afa0e89b2150c0dc0047524982`: 105,5 ms, `POST /ask` trả 503. Span `chat mock-llm-small` có trạng thái lỗi và event `exception` với `exception.type = utils.mock_llm.LLMError`, `exception.message = Upstream LLM error: 503 Service Unavailable (mock)`. Log có `llm_error` và `http_request` status 503 cùng `trace_id`.
+
+Từ một `trace_id` trong log có thể mở thẳng trace trong Jaeger và ngược lại, nên không phải đoán request nào gây lỗi.
 
 ---
 
 ## 5. Benchmark scaling (production, Locust headless, 100 users, 2 phút)
 
-_Chưa làm. Thuộc CP8: Locust headless với 1 và 3 instance, file `benchmark-results/scale_1_stats.csv` và `scale_3_stats.csv`._
+File gốc: `benchmark-results/scale_1_stats.csv` và `scale_3_stats.csv`. Dòng Aggregated:
+
+| Chỉ số | 1 instance | 3 instance |
+|---|---|---|
+| Số request | 6803 | 7479 |
+| Lỗi | 62 | 71 |
+| RPS | 60,5 | 66,7 |
+| Trung bình | 434 ms | 250 ms |
+| p50 | 220 ms | 200 ms |
+| p95 | 1700 ms | 540 ms |
+| p99 | 2500 ms | 1700 ms |
+| Max | 5440 ms | 3437 ms |
+
+Giải thích:
+- **p95 giảm hơn 3 lần (1700 xuống 540 ms), p50 gần như không đổi.** Một instance bị giới hạn 0,5 CPU nên khi 100 user dồn vào, request phải xếp hàng. Ba instance chia tải nên hàng đợi gần như biến mất, chỉ tail mới thấy khác biệt.
+- **RPS chỉ tăng khoảng 10%** không phải vì scale kém. Locust có thời gian nghỉ giữa các request nên tải đưa vào có trần khoảng 69 RPS. Ba instance đã gần chạm trần đó.
+- **p99 vẫn 1700 ms** vì các request chậm do chính lời gọi LLM giả lập (tỉ lệ chậm cố định) không nhanh hơn khi thêm instance.
+- Số lỗi tương đương (khoảng 1%) vì lỗi đến từ tỉ lệ lỗi mock, không phải do quá tải.
+
+Lần chạy đầu không hợp lệ: `docker compose run` tự đưa số instance về 1 khi thiếu `--no-deps`. Tôi chạy lại với `--no-deps` và chỉ dùng số liệu lần chạy lại.
 
 ---
 
 ## 6. Kết luận
 
-_Chưa làm, sẽ viết sau khi hoàn thành CP8._
+- **Quan sát hoạt động.** Cả bốn alert đều firing trong 38–163 giây sau khi gây lỗi, đủ nhanh để phát hiện nhưng chậm hơn khoảng `for:` vì Prometheus cần cửa sổ rate 1 phút để nhìn thấy thay đổi.
+- **Trace + log nối bằng `trace_id`** cho biết ngay span nào chậm hoặc lỗi. Ở trace chậm, 98% thời gian nằm ở lời gọi LLM.
+- **Điểm mù.** Alert không bắt được suy giảm chất lượng (thí nghiệm E). Số liệu 5xx cũng không thấy lỗi 504 do nginx trả ra vì metric lấy từ phía agent.
+- **Ngưỡng cost cần có độ chênh.** Ở 30 user chi phí nền ($2,09/giờ) đã sát ngưỡng $2/giờ, nên alert dễ kêu sai. Ngưỡng nên dựa trên chi phí nền thực đo.
+- **Scale.** Thêm instance cải thiện rõ p95 (1700 xuống 540 ms) nhưng không cải thiện p99, vì tail do LLM chậm chứ không do thiếu tài nguyên.
+- **Hạn chế.** Tất cả chạy local với LLM giả lập, tải do Locust tạo. Chưa đo trên Render và workflow CI eval chưa chạy trong GitHub Actions.
