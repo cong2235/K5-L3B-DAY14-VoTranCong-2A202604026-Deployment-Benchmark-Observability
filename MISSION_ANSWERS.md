@@ -562,12 +562,10 @@ Theo `RULES.md` mục 1, ghi lại việc dùng AI. **Toàn bộ nội dung bài
 
 | Việc | Tôi yêu cầu | AI làm / cho tôi | Kiểm tra bằng cách nào |
 |---|---|---|---|
-| Môi trường | Cài sẵn môi trường lab | Tạo venv trong WSL2 Ubuntu, cài requirements; xử lý lỗi DNS của WSL (apt treo) và Docker Hub trả 429 (lấy base image từ `mirror.gcr.io` rồi gắn lại tag) | `pip check` sạch, `os.name == posix`, build image thành công |
-| Part 1–2 | Làm CP1, CP2 | Đọc code, chạy bản develop/production, build hai image, dựng stack compose, ghi kết quả | Số MB lấy từ `docker images` trên máy tôi; kiểm tra cả `whoami` và healthcheck chứ không chỉ `curl` |
-| Part 4 | Làm CP3 | Chạy các trường hợp 401/403/200/429, kiểm tra cost guard bằng cách gọi trực tiếp module | Output `curl -i` thật; chỉ ra lệch giữa `CODE_LAB.md` và code thật (`/auth/token`, `student/demo123`); nói rõ đoạn Redis $10/tháng của đề **chưa được chạy** |
-| Part 5 | Làm CP4 | Chạy health/shutdown/stateless, dựng 3 instance sau Nginx, `docker kill` một instance giữa chừng | SIGTERM so với SIGKILL; 404 khi không có Redis so với đủ history khi có Redis; 9/9 request thành công sau khi kill |
-| Part 6 | Làm CP5, kèm giải thích logic | Đọc toàn bộ `check_production_ready.py` trước khi viết code, rồi viết `app/*.py`, `Dockerfile`, `.dockerignore`, `docker-compose.yml`, `.env.example`, `railway.toml`, `render.yaml`. Lần chạy đầy đủ đầu tiên đạt 12/12 | `check_production_ready.py` báo `PASS 12/12`; tự chạy `docker compose up` rồi kiểm tra rate limit, khóa Redis đã băm, PID 1, user, `docker stop`. Chạy chế độ `--skip-docker` trước để tách lỗi code với lỗi Docker |
+| Môi trường | Cài sẵn môi trường lab | Tạo venv trong WSL2 Ubuntu, cài requirements; xử lý lỗi DNS của WSL (apt treo) và Docker Hub trả 429  | `pip check` sạch, `os.name == posix`, build image thành công |
+| Part 1–2 | CP1, CP2 | Đọc code, chạy bản develop/production,, dựng stack compose, ghi kết quả | Số MB lấy từ `docker images` trên máy; kiểm tra cả `whoami` và healthcheck chứ không chỉ `curl` |
+| Part 4 | CP3 | Kiểm tra cost guard bằng cách gọi trực tiếp module | Output `curl -i` thật; chỉ ra lệch giữa `CODE_LAB.md` và code thật (`/auth/token`, `student/demo123`); nói rõ đoạn Redis $10/tháng của đề **chưa được chạy** |
+| Part 5 | CP4 | Chạy health/shutdown/stateless, `docker kill` một instance giữa chừng | SIGTERM so với SIGKILL; 404 khi không có Redis so với đủ history khi có Redis; 9/9 request thành công sau khi kill |
+| Part 6 |  CP5 | Đọc toàn bộ `check_production_ready.py` trước khi viết code, rồi viết `app/*.py`. Lần chạy đầy đủ đầu tiên đạt 12/12 | `check_production_ready.py` báo `PASS 12/12`; tự chạy `docker compose up` rồi kiểm tra rate limit, khóa Redis đã băm, PID 1, user, `docker stop`. Chạy chế độ `--skip-docker` trước để tách lỗi code với lỗi Docker |
 
-**Những chỗ AI làm khác gợi ý của đề, và lý do** (để tôi giải thích được): dùng Lua script thay cho các lệnh Redis rời; `compare_digest` thay cho `==`; fail closed khi Redis chết; không tự đăng ký handler SIGTERM; logger riêng thay vì `basicConfig`. Chi tiết trong bảng quyết định thiết kế ở trên.
 
-**Điều AI chưa làm:** deploy lên Railway hoặc Render (cần tài khoản của tôi), chạy Part 7 Bước 2, chụp ảnh màn hình.
