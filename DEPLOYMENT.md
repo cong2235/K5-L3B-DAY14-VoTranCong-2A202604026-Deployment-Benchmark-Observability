@@ -64,8 +64,6 @@ Khai báo trong `06-lab-complete/render.yaml`, giá trị thật nằm trên Ren
 
 ## Screenshots
 
-_Chưa có. Cần chụp và lưu vào `screenshots/`:_
-
-- Dashboard Render: Blueprint đã sync thành công, 2 service
-- Service `ai-agent` đang chạy (Live)
-- Kết quả 4 lệnh test ở trên
+- [Dashboard Render: `ai-agent` Deployed, `agent-redis` Available](screenshots/dashboard.png)
+- [Service `ai-agent` Live, URL public, commit trên nhánh `main`](screenshots/running.png) (danh sách deploy còn thấy lần sync đầu bị lỗi do thiếu `rootDir`, rồi lần thành công sau khi sửa)
+- [Kết quả test: `/health` 200, `/ready` 200, `/ask` không key 401, `/ask` có key 200](screenshots/test.png) (API key nhập bằng ô ẩn nên không lộ)
